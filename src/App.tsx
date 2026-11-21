@@ -19,6 +19,7 @@ import { HdrPanel } from './components/HdrPanel';
 import { MediaDrawer } from './components/MediaDrawer';
 import { NodePipeline } from './components/NodePipeline';
 import { PrimaryPanel } from './components/PrimaryPanel';
+import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
 import { QualifierPanel } from './components/QualifierPanel';
 import { ScopesPanel } from './components/ScopesPanel';
 import { SAMPLE_MEDIA } from './data/presets';
@@ -631,6 +632,7 @@ export default function App() {
           >
             Export LUT
           </button>
+          <PWAInstallButton />
         </nav>
 
         {/* Zone 3: Single Primary Action */}
@@ -1076,6 +1078,8 @@ export default function App() {
         onExportImage={handleExportImage}
         onExportCubeLut={handleExportCubeLut}
       />
+
+      <OfflineIndicator />
     </div>
   );
 }
