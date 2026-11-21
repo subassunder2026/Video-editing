@@ -31,6 +31,10 @@
           },
           true
         );
+        window.addEventListener('beforeinstallprompt', function (e) {
+          e.preventDefault();
+          window.__deferredPWAInstallPrompt = e;
+        });
       })();
     </script>
     <title>ChromaGrade — Professional Color Grading Workstation</title>

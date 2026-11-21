@@ -1030,6 +1030,44 @@ export class WebGLColorGrader {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
+  /** Renders a pure graded frame (no wipe/split/false-color/zebra overlays) to the canvas for video recording */
+  public renderCleanFrame(nodes: GradeNode[], activeNodeId: string, timeSeed = 1.0) {
+    if (this.disposed) return;
+    const { gl } = this;
+    const cw = this.canvas.width;
+    const ch = this.canvas.height;
+
+    const gradedTex = this.runNodePipeline(
+      this.sourceTex,
+      cw,
+      ch,
+      nodes,
+      activeNodeId,
+      false,
+      timeSeed
+    );
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, cw, ch);
+    gl.useProgram(this.displayProgram);
+    gl.bindVertexArray(this.quadVao);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
+    gl.uniform1i(gl.getUniformLocation(this.displayProgram, 'uOriginal'), 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, gradedTex);
+    gl.uniform1i(gl.getUniformLocation(this.displayProgram, 'uGraded'), 1);
+
+    gl.uniform1i(gl.getUniformLocation(this.displayProgram, 'uBypass'), 0);
+    gl.uniform1i(gl.getUniformLocation(this.displayProgram, 'uCompareMode'), 0);
+    gl.uniform1f(gl.getUniformLocation(this.displayProgram, 'uWipePos'), 0.5);
+    gl.uniform1i(gl.getUniformLocation(this.displayProgram, 'uOverlayMode'), 0);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
   /** Fast pixel readback (240x135 RGBA8) for live Parade, Waveform, Vectorscope & Histogram */
   public readScopePixels(): { data: Uint8Array; width: number; height: number } {
     const { gl } = this;

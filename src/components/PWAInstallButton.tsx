@@ -79,29 +79,17 @@ export const PWAInstallButton: React.FC = () => {
                   </li>
                 </ol>
               </div>
-            ) : (
+            ) : isInIframe ? (
               <div className="mt-4 space-y-3 text-xs leading-relaxed text-[#A0A0AA]">
-                {isInIframe ? (
-                  <p className="text-[#D4D4DC]">
-                    Browsers only enable the 1-click desktop installer when the app is opened in its own top-level tab (outside the embedded preview frame).
-                  </p>
-                ) : (
-                  <p className="text-[#D4D4DC]">
-                    Install ChromaGrade as a standalone offline-ready desktop application in Chrome, Edge, or Brave:
-                  </p>
-                )}
-
+                <p className="text-[#D4D4DC]">
+                  Browsers block 1-click desktop installation inside embedded preview frames. Open ChromaGrade in its own tab first:
+                </p>
                 <ol className="list-decimal space-y-2 pl-4">
-                  {isInIframe && (
-                    <li>
-                      Open ChromaGrade in a standalone browser tab using the link below (or the workspace&apos;s <strong className="text-white">Open in new tab</strong> button).
-                    </li>
-                  )}
                   <li>
-                    Click the <strong className="text-white">Install App</strong> button in the top bar, or click the install icon in your browser&apos;s address bar (or menu <strong className="text-white">⋮ → Cast, save, and share → Install page as app</strong>).
+                    Click <strong className="text-white">Open Standalone Tab</strong> below.
                   </li>
                   <li>
-                    ChromaGrade will appear on your desktop / Applications folder and work offline with full GPU WebGL2 grading.
+                    In the new tab, click <strong className="text-white">Install App</strong> or the install icon on the right side of Chrome&apos;s address bar.
                   </li>
                 </ol>
 
@@ -131,6 +119,30 @@ export const PWAInstallButton: React.FC = () => {
                         Copy Link
                       </>
                     )}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="mt-4 space-y-3 text-xs leading-relaxed text-[#A0A0AA]">
+                <p className="text-[#D4D4DC]">
+                  Your browser did not open the automatic install prompt (this happens in Incognito/Private mode, Firefox, or if ChromaGrade is already installed). Install directly from your browser toolbar:
+                </p>
+                <ol className="list-decimal space-y-2 pl-4">
+                  <li>
+                    In <strong className="text-white">Chrome / Edge / Brave</strong>, click the <strong className="text-white">Install</strong> icon on the right side of the address bar, or open menu <strong className="text-white">⋮ → Cast, save, and share → Install page as app…</strong>
+                  </li>
+                  <li>
+                    Click <strong className="text-white">Install</strong> in the browser confirmation box to add ChromaGrade to your desktop / Applications folder.
+                  </li>
+                </ol>
+
+                <div className="mt-4 flex justify-end pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setShowGuide(false)}
+                    className="rounded border border-white/15 bg-[#1B1B20] px-4 py-1.5 text-xs font-medium text-[#ECECEF] transition-colors hover:border-white/30"
+                  >
+                    Done
                   </button>
                 </div>
               </div>

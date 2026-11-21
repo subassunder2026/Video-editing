@@ -13,7 +13,11 @@ import {
   Undo2,
 } from 'lucide-react';
 import { CurveEditor } from './components/CurveEditor';
-import { ExportModal } from './components/ExportModal';
+import {
+  ExportModal,
+  type VideoExportOptions,
+  type VideoExportProgress,
+} from './components/ExportModal';
 import { FinishPanel } from './components/FinishPanel';
 import { HdrPanel } from './components/HdrPanel';
 import { MediaDrawer } from './components/MediaDrawer';
@@ -88,7 +92,15 @@ export default function App() {
 
   // Export modal
   const [exportOpen, setExportOpen] = useState(false);
-  const [exportTab, setExportTab] = useState<'frame' | 'lut'>('frame');
+  const [exportTab, setExportTab] = useState<'video' | 'frame' | 'lut'>('frame');
+  const [videoProgress, setVideoProgress] = useState<VideoExportProgress>({
+    active: false,
+    percent: 0,
+    currentSec: 0,
+    durationSec: 0,
+    error: null,
+  });
+  const cancelVideoExportRef = useRef<(() => void) | null>(null);
 
   // WebGL & Scope refs
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -471,6 +483,255 @@ export default function App() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  // GPU-accelerated Graded Video Export (MP4 H.264 or WebM VP9 with original audio preserved)
+  const handleCancelVideoExport = useCallback(() => {
+    cancelVideoExportRef.current?.();
+  }, []);
+
+  const handleExportVideo = useCallback(
+    async (options: VideoExportOptions) => {
+      const grader = graderRef.current;
+      const canvas = canvasRef.current;
+      if (!grader || !canvas || activeMedia.type !== 'video') return;
+
+      if (typeof MediaRecorder === 'undefined') {
+        setVideoProgress({
+          active: false,
+          percent: 0,
+          currentSec: 0,
+          durationSec: videoDuration,
+          error: 'Video recording is not supported in this browser. Try Chrome, Edge, or Brave.',
+        });
+        return;
+      }
+
+      // Pause interactive preview playback during render
+      if (sourceElemRef.current instanceof HTMLVideoElement) {
+        sourceElemRef.current.pause();
+        setVideoPlaying(false);
+      }
+
+      // Choose best supported MIME type for selected container
+      const candidates =
+        options.container === 'mp4'
+          ? [
+              'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+              'video/mp4;codecs=avc1.42E01E',
+              'video/mp4;codecs=h264',
+              'video/mp4',
+              'video/webm;codecs=vp9,opus',
+              'video/webm;codecs=vp9',
+              'video/webm',
+            ]
+          : [
+              'video/webm;codecs=vp9,opus',
+              'video/webm;codecs=vp9',
+              'video/webm;codecs=vp8,opus',
+              'video/webm',
+            ];
+      const mimeType = candidates.find((m) => MediaRecorder.isTypeSupported(m)) ?? '';
+      const outExt = mimeType.includes('mp4') ? 'mp4' : 'webm';
+
+      setVideoProgress({
+        active: true,
+        percent: 0,
+        currentSec: 0,
+        durationSec: videoDuration || 0,
+        error: null,
+      });
+
+      const exportVid = document.createElement('video');
+      exportVid.src = activeMedia.src;
+      exportVid.crossOrigin = 'anonymous';
+      exportVid.loop = false;
+      exportVid.playsInline = true;
+      exportVid.preload = 'auto';
+
+      let audioCtx: AudioContext | null = null;
+      let recorder: MediaRecorder | null = null;
+      let rafId = 0;
+      let cancelled = false;
+      let finished = false;
+      let streamTracks: MediaStreamTrack[] = [];
+
+      const cleanup = () => {
+        if (rafId) cancelAnimationFrame(rafId);
+        exportVid.pause();
+        exportVid.removeAttribute('src');
+        exportVid.load();
+        streamTracks.forEach((t) => t.stop());
+        streamTracks = [];
+        if (audioCtx) {
+          audioCtx.close().catch(() => {});
+          audioCtx = null;
+        }
+        cancelVideoExportRef.current = null;
+        // Restore interactive preview frame immediately
+        if (sourceElemRef.current instanceof HTMLVideoElement && graderRef.current) {
+          graderRef.current.setSource(sourceElemRef.current);
+          triggerRender(true);
+        }
+      };
+
+      cancelVideoExportRef.current = () => {
+        cancelled = true;
+        if (recorder && recorder.state !== 'inactive') {
+          try {
+            recorder.stop();
+          } catch {
+            // ignore
+          }
+        }
+        cleanup();
+        setVideoProgress({
+          active: false,
+          percent: 0,
+          currentSec: 0,
+          durationSec: videoDuration,
+          error: null,
+        });
+      };
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onReady = () => {
+            exportVid.removeEventListener('canplay', onReady);
+            exportVid.removeEventListener('error', onErr);
+            resolve();
+          };
+          const onErr = () => {
+            exportVid.removeEventListener('canplay', onReady);
+            exportVid.removeEventListener('error', onErr);
+            reject(new Error('Could not load video stream for export.'));
+          };
+          exportVid.addEventListener('canplay', onReady);
+          exportVid.addEventListener('error', onErr);
+          exportVid.load();
+        });
+
+        if (cancelled) return;
+
+        const dur = Number.isFinite(exportVid.duration) && exportVid.duration > 0
+          ? exportVid.duration
+          : Math.max(0.1, videoDuration);
+
+        // Draw first frame cleanly before starting recorder
+        exportVid.currentTime = 0;
+        grader.setSource(exportVid);
+        grader.renderCleanFrame(nodes, activeNodeId, 0);
+
+        const canvasStream = canvas.captureStream(options.fps);
+        const combinedStream = new MediaStream();
+        canvasStream.getVideoTracks().forEach((t) => {
+          combinedStream.addTrack(t);
+          streamTracks.push(t);
+        });
+
+        // Silently route original audio into MediaRecorder stream (without playing through speakers)
+        if (options.includeAudio) {
+          try {
+            audioCtx = new AudioContext();
+            const sourceNode = audioCtx.createMediaElementSource(exportVid);
+            const destNode = audioCtx.createMediaStreamDestination();
+            sourceNode.connect(destNode);
+            destNode.stream.getAudioTracks().forEach((t) => {
+              combinedStream.addTrack(t);
+              streamTracks.push(t);
+            });
+            exportVid.muted = false;
+          } catch {
+            exportVid.muted = true;
+          }
+        } else {
+          exportVid.muted = true;
+        }
+
+        const chunks: BlobPart[] = [];
+        const recOptions: MediaRecorderOptions = {
+          videoBitsPerSecond: options.bitrateMbps * 1_000_000,
+        };
+        if (mimeType) recOptions.mimeType = mimeType;
+
+        recorder = new MediaRecorder(combinedStream, recOptions);
+        recorder.ondataavailable = (ev) => {
+          if (ev.data && ev.data.size > 0) chunks.push(ev.data);
+        };
+
+        const stoppedPromise = new Promise<Blob>((resolve) => {
+          recorder!.onstop = () => {
+            resolve(new Blob(chunks, { type: mimeType || `video/${outExt}` }));
+          };
+        });
+
+        recorder.start(250);
+
+        const pumpFrame = () => {
+          if (cancelled || finished) return;
+          if (exportVid.readyState >= 2) {
+            grader.setSource(exportVid);
+            grader.renderCleanFrame(nodes, activeNodeId, exportVid.currentTime);
+            const cur = exportVid.currentTime;
+            setVideoProgress({
+              active: true,
+              percent: Math.min(99, (cur / dur) * 100),
+              currentSec: cur,
+              durationSec: dur,
+              error: null,
+            });
+          }
+          if (!exportVid.ended) {
+            rafId = requestAnimationFrame(pumpFrame);
+          }
+        };
+
+        exportVid.onended = async () => {
+          if (cancelled || finished) return;
+          finished = true;
+          if (rafId) cancelAnimationFrame(rafId);
+          grader.setSource(exportVid);
+          grader.renderCleanFrame(nodes, activeNodeId, dur);
+
+          if (recorder && recorder.state !== 'inactive') {
+            recorder.stop();
+          }
+          const blob = await stoppedPromise;
+          cleanup();
+
+          if (!cancelled && blob.size > 0) {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${activeMedia.name.replace(/\s+/g, '_')}_graded.${outExt}`;
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 5000);
+          }
+
+          setVideoProgress({
+            active: false,
+            percent: 100,
+            currentSec: dur,
+            durationSec: dur,
+            error: null,
+          });
+          setExportOpen(false);
+        };
+
+        await exportVid.play();
+        rafId = requestAnimationFrame(pumpFrame);
+      } catch (err) {
+        cleanup();
+        setVideoProgress({
+          active: false,
+          percent: 0,
+          currentSec: 0,
+          durationSec: videoDuration,
+          error: err instanceof Error ? err.message : 'Video export failed.',
+        });
+      }
+    },
+    [activeMedia, activeNodeId, nodes, triggerRender, videoDuration]
+  );
+
   // Global keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -640,12 +901,12 @@ export default function App() {
           <button
             type="button"
             onClick={() => {
-              setExportTab('frame');
+              setExportTab(activeMedia.type === 'video' ? 'video' : 'frame');
               setExportOpen(true);
             }}
             className="rounded bg-[#E5892E] px-3.5 py-1.5 text-xs font-semibold text-[#0C0C0E] transition-colors hover:bg-[#EE9842] whitespace-nowrap shrink-0"
           >
-            Export Frame
+            {activeMedia.type === 'video' ? 'Export Video' : 'Export Frame'}
           </button>
         </div>
       </header>
@@ -1068,13 +1329,20 @@ export default function App() {
         </div>
       </section>
 
-      {/* Full-Resolution Frame & .cube 3D LUT Export Modal */}
+      {/* Full-Resolution Video, Frame & .cube 3D LUT Export Modal */}
       <ExportModal
         open={exportOpen}
         initialTab={exportTab}
+        mediaType={activeMedia.type}
+        videoDuration={videoDuration}
         sourceDimensions={sourceDimensions}
         mediaName={activeMedia.name}
-        onClose={() => setExportOpen(false)}
+        videoProgress={videoProgress}
+        onClose={() => {
+          if (!videoProgress.active) setExportOpen(false);
+        }}
+        onExportVideo={handleExportVideo}
+        onCancelVideoExport={handleCancelVideoExport}
         onExportImage={handleExportImage}
         onExportCubeLut={handleExportCubeLut}
       />
