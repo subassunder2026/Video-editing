@@ -84,6 +84,12 @@ uniform int uHasLut;
 uniform float uLutMix;
 uniform float uLutSize;
 
+// Power Window Spatial Mask
+uniform int uMaskShape;      // 0=none, 1=ellipse, 2=rectangle, 3=linear
+uniform vec2 uMaskCenter;    // normalized WebGL UV center
+uniform vec2 uMaskSize;      // width, height radii
+uniform vec4 uMaskParams;    // x=rotRad, y=feather, z=invert(0/1), w=showMatte(0/1)
+
 const vec3 LUMA_W = vec3(0.2126, 0.7152, 0.0722);
 
 float getLuma(vec3 c) {
@@ -456,6 +462,45 @@ void main() {
     float l = clamp(getLuma(col), 0.0, 1.0);
     float lumWeight = 1.0 - abs(l - 0.45) * 1.15;
     col += vec3(grainVal) * uGrain.x * 0.16 * max(0.2, lumWeight);
+  }
+
+  // 17. Power Window Spatial Mask (Ellipse / Rectangle / Linear Gradient)
+  float winMask = 1.0;
+  if (uDisableSpatial == 0 && uMaskShape > 0) {
+    vec2 d = vUv - uMaskCenter;
+    float cs = cos(uMaskParams.x);
+    float sn = sin(uMaskParams.x);
+    vec2 rot = vec2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
+    float feather = max(0.004, uMaskParams.y);
+
+    if (uMaskShape == 1) {
+      // Ellipse
+      vec2 norm = rot / max(vec2(0.01), uMaskSize);
+      float dist = length(norm);
+      winMask = 1.0 - smoothstep(max(0.0, 1.0 - feather), 1.0 + feather, dist);
+    } else if (uMaskShape == 2) {
+      // Rectangle (SDF)
+      vec2 q = abs(rot) - max(vec2(0.01), uMaskSize);
+      float sdf = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+      winMask = 1.0 - smoothstep(-feather * 0.5, feather * 0.5, sdf);
+    } else if (uMaskShape == 3) {
+      // Linear Gradient (top/side ND filter along rotated Y axis)
+      winMask = smoothstep(-feather * 0.65, feather * 0.65, rot.y);
+    }
+
+    if (uMaskParams.z > 0.5) {
+      winMask = 1.0 - winMask;
+    }
+
+    col = mix(orig, col, clamp(uOpacity * winMask, 0.0, 1.0));
+
+    if (uMaskParams.w > 0.5) {
+      float gl = getLuma(clamp(col, 0.0, 1.0));
+      vec3 dim = vec3(gl * 0.20 + 0.05);
+      col = mix(dim, col, winMask);
+    }
+    fragColor = vec4(clamp(col, 0.0, 1.0), srcSample.a);
+    return;
   }
 
   col = mix(orig, col, clamp(uOpacity, 0.0, 1.0));
@@ -971,6 +1016,25 @@ export class WebGLColorGrader {
       );
       gl.uniform2f(gl.getUniformLocation(this.nodeProgram, 'uHalation'), f.halationAmount, f.halationThreshold);
       gl.uniform2f(gl.getUniformLocation(this.nodeProgram, 'uGrain'), f.grainAmount, f.grainSize);
+
+      // Power Window Spatial Mask uniforms
+      const m = node.mask;
+      const shapeInt =
+        m.shape === 'ellipse' ? 1 : m.shape === 'rectangle' ? 2 : m.shape === 'linear' ? 3 : 0;
+      gl.uniform1i(gl.getUniformLocation(this.nodeProgram, 'uMaskShape'), shapeInt);
+      gl.uniform2f(
+        gl.getUniformLocation(this.nodeProgram, 'uMaskCenter'),
+        m.centerX,
+        1.0 - m.centerY
+      );
+      gl.uniform2f(gl.getUniformLocation(this.nodeProgram, 'uMaskSize'), m.width, m.height);
+      gl.uniform4f(
+        gl.getUniformLocation(this.nodeProgram, 'uMaskParams'),
+        (m.rotation * Math.PI) / 180,
+        m.feather,
+        m.invert ? 1 : 0,
+        !disableSpatial && isNodeActive && m.showMatte ? 1 : 0
+      );
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       currentInput = targetTex;

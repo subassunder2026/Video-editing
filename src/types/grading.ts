@@ -131,6 +131,21 @@ export interface CubeLutData {
   data: Float32Array;
 }
 
+export type MaskShape = 'none' | 'ellipse' | 'rectangle' | 'linear';
+
+export interface MaskState {
+  shape: MaskShape;
+  centerX: number;     // [0, 1]
+  centerY: number;     // [0, 1]
+  width: number;       // [0.02, 1.0]
+  height: number;      // [0.02, 1.0]
+  rotation: number;    // [-180, 180] degrees
+  feather: number;     // [0.0, 0.8]
+  invert: boolean;
+  showOverlay: boolean;
+  showMatte: boolean;
+}
+
 export interface GradeNode {
   id: string;
   name: string;
@@ -140,11 +155,21 @@ export interface GradeNode {
   hdr: HdrState;
   curves: CurvesState;
   qualifier: QualifierState;
+  mask: MaskState;
   finish: FinishState;
   lut: CubeLutData | null;
 }
 
-export type ToolTab = 'primaries' | 'hdr' | 'curves' | 'qualifier' | 'finish';
+export interface VideoShot {
+  id: string;
+  name: string;
+  startSec: number;
+  endSec: number;
+  nodes: GradeNode[];
+  activeNodeId: string;
+}
+
+export type ToolTab = 'primaries' | 'hdr' | 'curves' | 'qualifier' | 'mask' | 'finish';
 export type PrimarySubMode = 'wheels' | 'log' | 'bars';
 export type CompareMode = 'normal' | 'wipe' | 'split';
 export type ScopeMode = 'parade' | 'waveform' | 'vectorscope' | 'histogram';
@@ -279,6 +304,21 @@ export function createDefaultFinish(): FinishState {
   };
 }
 
+export function createDefaultMask(): MaskState {
+  return {
+    shape: 'none',
+    centerX: 0.5,
+    centerY: 0.5,
+    width: 0.32,
+    height: 0.36,
+    rotation: 0,
+    feather: 0.22,
+    invert: false,
+    showOverlay: true,
+    showMatte: false,
+  };
+}
+
 export function createGradeNode(name = 'Primary Balance', id?: string): GradeNode {
   return {
     id: id ?? `node_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -289,6 +329,7 @@ export function createGradeNode(name = 'Primary Balance', id?: string): GradeNod
     hdr: createDefaultHdr(),
     curves: createDefaultCurves(),
     qualifier: createDefaultQualifier(),
+    mask: createDefaultMask(),
     finish: createDefaultFinish(),
     lut: null,
   };
@@ -332,6 +373,7 @@ export function cloneGradeNode(node: GradeNode, newId?: string): GradeNode {
       satVsLum: node.curves.satVsLum.map((p) => ({ ...p })),
     },
     qualifier: { ...node.qualifier },
+    mask: { ...node.mask },
     finish: { ...node.finish },
     lut: node.lut,
   };

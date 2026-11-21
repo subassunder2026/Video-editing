@@ -1,12 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  BookOpen,
   Camera,
   Columns2,
   EyeOff,
   Flame,
-  Pause,
-  Play,
   Redo2,
   RotateCcw,
   SplitSquareHorizontal,
@@ -20,12 +19,14 @@ import {
 } from './components/ExportModal';
 import { FinishPanel } from './components/FinishPanel';
 import { HdrPanel } from './components/HdrPanel';
+import { MaskPanel } from './components/MaskPanel';
 import { MediaDrawer } from './components/MediaDrawer';
 import { NodePipeline } from './components/NodePipeline';
 import { PrimaryPanel } from './components/PrimaryPanel';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
 import { QualifierPanel } from './components/QualifierPanel';
 import { ScopesPanel } from './components/ScopesPanel';
+import { ShotTimelineBar } from './components/ShotTimelineBar';
 import { SAMPLE_MEDIA } from './data/presets';
 import { serializeCubeLut } from './engine/cubeLut';
 import { WebGLColorGrader } from './engine/webglGrader';
@@ -42,6 +43,7 @@ import {
   type MediaItem,
   type SnapshotStill,
   type ToolTab,
+  type VideoShot,
   type ViewerOverlay,
 } from './types/grading';
 
@@ -52,8 +54,20 @@ const TOOL_TABS: Array<{ id: ToolTab; label: string }> = [
   { id: 'hdr', label: 'HDR Zones' },
   { id: 'curves', label: 'Curves' },
   { id: 'qualifier', label: 'HSL Qualifier' },
+  { id: 'mask', label: 'Power Window' },
   { id: 'finish', label: 'Film & 3D LUT' },
 ];
+
+function findShotAtTime(shots: VideoShot[], timeSec: number): VideoShot | null {
+  if (shots.length === 0) return null;
+  for (let i = 0; i < shots.length; i++) {
+    const s = shots[i];
+    if (timeSec >= s.startSec && (timeSec < s.endSec || i === shots.length - 1)) {
+      return s;
+    }
+  }
+  return shots[shots.length - 1];
+}
 
 export default function App() {
   // Media library & active source
@@ -63,10 +77,15 @@ export default function App() {
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
 
-  // Video state (when a video file is loaded)
+  // Video & Multi-Shot Timeline state (when a video file is loaded)
   const [videoPlaying, setVideoPlaying] = useState(false);
   const [videoTime, setVideoTime] = useState(0);
   const [videoDuration, setVideoDuration] = useState(0);
+  const [shots, setShots] = useState<VideoShot[]>([]);
+  const [activeShotId, setActiveShotId] = useState<string>('');
+  const [copiedShotNodes, setCopiedShotNodes] = useState<GradeNode[] | null>(null);
+  const shotsRef = useRef<VideoShot[]>([]);
+  const activeShotIdRef = useRef<string>('');
 
   // Grading Serial Node Graph & Undo/Redo history
   const [nodes, setNodes] = useState<GradeNode[]>(() => [createGradeNode('Primary Balance', 'node_1')]);
@@ -219,12 +238,33 @@ export default function App() {
     [nodes, activeNodeId, bypass, compareMode, wipePos, overlayMode, refreshScopes]
   );
 
+  // Keep refs synced with shots & activeShotId for 60fps video loops & export
+  useEffect(() => {
+    shotsRef.current = shots;
+  }, [shots]);
+
+  useEffect(() => {
+    activeShotIdRef.current = activeShotId;
+  }, [activeShotId]);
+
+  // Whenever nodes/activeNodeId change while grading a video, persist them into the active VideoShot
+  useEffect(() => {
+    if (activeMedia.type !== 'video' || !activeShotId) return;
+    setShots((prev) =>
+      prev.map((s) =>
+        s.id === activeShotId ? { ...s, nodes, activeNodeId } : s
+      )
+    );
+  }, [activeMedia.type, activeShotId, nodes, activeNodeId]);
+
   // Load active media item (Image or Video)
   useEffect(() => {
     setMediaError(null);
     setVideoPlaying(false);
     setVideoTime(0);
     setVideoDuration(0);
+    setShots([]);
+    setActiveShotId('');
 
     // Clean up old video element if any
     if (sourceElemRef.current instanceof HTMLVideoElement) {
@@ -257,11 +297,34 @@ export default function App() {
 
       video.onloadeddata = () => {
         sourceElemRef.current = video;
-        setVideoDuration(video.duration || 0);
+        const dur = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 10;
+        setVideoDuration(dur);
+        const initialNode = createGradeNode('Primary Balance', `node_${Date.now()}`);
+        const initialShot: VideoShot = {
+          id: `shot_${Date.now()}`,
+          name: 'Shot 01',
+          startSec: 0,
+          endSec: dur,
+          nodes: [initialNode],
+          activeNodeId: initialNode.id,
+        };
+        setShots([initialShot]);
+        setActiveShotId(initialShot.id);
+        setNodes([initialNode]);
+        setActiveNodeId(initialNode.id);
         if (graderRef.current) {
           graderRef.current.setSource(video);
           setSourceDimensions(graderRef.current.getSourceDimensions());
-          triggerRender(true);
+          graderRef.current.render({
+            nodes: [initialNode],
+            activeNodeId: initialNode.id,
+            bypass,
+            compareMode,
+            wipePos,
+            overlayMode,
+            timeSeed: 1.0,
+          });
+          refreshScopes(true);
         }
       };
       video.onerror = () => {
@@ -282,24 +345,47 @@ export default function App() {
     triggerRender(false);
   }, [triggerRender]);
 
-  // Video animation loop when playing
+  // Switch active shot automatically when playhead enters a different shot time range
+  const switchShotIfNeeded = useCallback((t: number) => {
+    const list = shotsRef.current;
+    if (list.length <= 1) return;
+    const hit = findShotAtTime(list, t);
+    if (hit && hit.id !== activeShotIdRef.current) {
+      activeShotIdRef.current = hit.id;
+      setActiveShotId(hit.id);
+      setNodes(hit.nodes);
+      setActiveNodeId(hit.activeNodeId);
+    }
+  }, []);
+
+  // Video animation loop when playing (automatically evaluates per-shot node graph across cuts!)
   useEffect(() => {
     if (activeMedia.type !== 'video' || !videoPlaying) return;
     let rafId = 0;
     const tick = (now: number) => {
       const vid = sourceElemRef.current;
       if (vid instanceof HTMLVideoElement && vid.readyState >= 2 && graderRef.current) {
+        const t = vid.currentTime;
+        const shot = findShotAtTime(shotsRef.current, t);
+        const frameNodes = shot ? shot.nodes : nodes;
+        const frameActiveId = shot ? shot.activeNodeId : activeNodeId;
+        if (shot && shot.id !== activeShotIdRef.current) {
+          activeShotIdRef.current = shot.id;
+          setActiveShotId(shot.id);
+          setNodes(shot.nodes);
+          setActiveNodeId(shot.activeNodeId);
+        }
         graderRef.current.setSource(vid);
         graderRef.current.render({
-          nodes,
-          activeNodeId,
+          nodes: frameNodes,
+          activeNodeId: frameActiveId,
           bypass,
           compareMode,
           wipePos,
           overlayMode,
           timeSeed: (now * 0.001) % 100,
         });
-        setVideoTime(vid.currentTime);
+        setVideoTime(t);
         refreshScopes(false);
       }
       rafId = requestAnimationFrame(tick);
@@ -331,20 +417,125 @@ export default function App() {
     }
   }, []);
 
-  const handleVideoSeek = (sec: number) => {
-    const vid = sourceElemRef.current;
-    if (!(vid instanceof HTMLVideoElement)) return;
-    vid.currentTime = sec;
-    setVideoTime(sec);
-    const onSeeked = () => {
-      if (graderRef.current) {
-        graderRef.current.setSource(vid);
-        triggerRender(true);
-      }
-      vid.removeEventListener('seeked', onSeeked);
+  const handleVideoSeek = useCallback(
+    (sec: number) => {
+      const vid = sourceElemRef.current;
+      if (!(vid instanceof HTMLVideoElement)) return;
+      vid.currentTime = sec;
+      setVideoTime(sec);
+      switchShotIfNeeded(sec);
+      const onSeeked = () => {
+        if (graderRef.current) {
+          const shot = findShotAtTime(shotsRef.current, sec);
+          graderRef.current.setSource(vid);
+          graderRef.current.render({
+            nodes: shot ? shot.nodes : nodes,
+            activeNodeId: shot ? shot.activeNodeId : activeNodeId,
+            bypass,
+            compareMode,
+            wipePos,
+            overlayMode,
+            timeSeed: sec,
+          });
+          refreshScopes(true);
+        }
+        vid.removeEventListener('seeked', onSeeked);
+      };
+      vid.addEventListener('seeked', onSeeked);
+    },
+    [
+      switchShotIfNeeded,
+      nodes,
+      activeNodeId,
+      bypass,
+      compareMode,
+      wipePos,
+      overlayMode,
+      refreshScopes,
+    ]
+  );
+
+  // Multi-Shot Timeline Operations
+  const handleSelectShot = useCallback(
+    (shot: VideoShot) => {
+      activeShotIdRef.current = shot.id;
+      setActiveShotId(shot.id);
+      setNodes(shot.nodes);
+      setActiveNodeId(shot.activeNodeId);
+      const jumpTime = Math.min(shot.endSec - 0.02, shot.startSec + 0.02);
+      handleVideoSeek(Math.max(0, jumpTime));
+    },
+    [handleVideoSeek]
+  );
+
+  const handleSplitShot = useCallback(() => {
+    if (activeMedia.type !== 'video' || shots.length === 0) return;
+    const t = videoTime;
+    const idx = shots.findIndex((s) => t > s.startSec + 0.25 && t < s.endSec - 0.25);
+    if (idx === -1) return;
+
+    const target = shots[idx];
+    const freshNode = createGradeNode('Primary Balance', `node_${Date.now()}`);
+    const leftShot: VideoShot = { ...target, endSec: t };
+    const rightShot: VideoShot = {
+      id: `shot_${Date.now()}`,
+      name: `Shot ${String(shots.length + 1).padStart(2, '0')}`,
+      startSec: t,
+      endSec: target.endSec,
+      nodes: [freshNode],
+      activeNodeId: freshNode.id,
     };
-    vid.addEventListener('seeked', onSeeked);
-  };
+
+    const nextShots = [...shots.slice(0, idx), leftShot, rightShot, ...shots.slice(idx + 1)].map(
+      (s, i) => ({ ...s, name: `Shot ${String(i + 1).padStart(2, '0')}` })
+    );
+    shotsRef.current = nextShots;
+    activeShotIdRef.current = rightShot.id;
+    setShots(nextShots);
+    setActiveShotId(rightShot.id);
+    setNodes(rightShot.nodes);
+    setActiveNodeId(rightShot.activeNodeId);
+  }, [activeMedia.type, shots, videoTime]);
+
+  const handleCopyShotGrade = useCallback(() => {
+    setCopiedShotNodes(cloneNodes(nodes));
+  }, [nodes]);
+
+  const handlePasteShotGrade = useCallback(() => {
+    if (!copiedShotNodes) return;
+    const pasted = cloneNodes(copiedShotNodes);
+    setNodes(pasted);
+    setActiveNodeId(pasted[0].id);
+    commitHistory(pasted);
+  }, [copiedShotNodes, commitHistory]);
+
+  const handleMergeShot = useCallback(
+    (shotId: string) => {
+      if (shots.length <= 1) return;
+      const idx = shots.findIndex((s) => s.id === shotId);
+      if (idx === -1) return;
+      const next = [...shots];
+      if (idx > 0) {
+        next[idx - 1] = { ...next[idx - 1], endSec: next[idx].endSec };
+        next.splice(idx, 1);
+      } else {
+        next[1] = { ...next[1], startSec: next[0].startSec };
+        next.splice(0, 1);
+      }
+      const renamed = next.map((s, i) => ({
+        ...s,
+        name: `Shot ${String(i + 1).padStart(2, '0')}`,
+      }));
+      const target = renamed[Math.max(0, idx - 1)];
+      shotsRef.current = renamed;
+      activeShotIdRef.current = target.id;
+      setShots(renamed);
+      setActiveShotId(target.id);
+      setNodes(target.nodes);
+      setActiveNodeId(target.activeNodeId);
+    },
+    [shots]
+  );
 
   // Handle local media upload (images & video)
   const importFiles = useCallback((files: FileList | null) => {
@@ -668,9 +859,14 @@ export default function App() {
         const pumpFrame = () => {
           if (cancelled || finished) return;
           if (exportVid.readyState >= 2) {
-            grader.setSource(exportVid);
-            grader.renderCleanFrame(nodes, activeNodeId, exportVid.currentTime);
             const cur = exportVid.currentTime;
+            const shot = findShotAtTime(shotsRef.current, cur);
+            grader.setSource(exportVid);
+            grader.renderCleanFrame(
+              shot ? shot.nodes : nodes,
+              shot ? shot.activeNodeId : activeNodeId,
+              cur
+            );
             setVideoProgress({
               active: true,
               percent: Math.min(99, (cur / dur) * 100),
@@ -688,8 +884,13 @@ export default function App() {
           if (cancelled || finished) return;
           finished = true;
           if (rafId) cancelAnimationFrame(rafId);
+          const lastShot = findShotAtTime(shotsRef.current, dur);
           grader.setSource(exportVid);
-          grader.renderCleanFrame(nodes, activeNodeId, dur);
+          grader.renderCleanFrame(
+            lastShot ? lastShot.nodes : nodes,
+            lastShot ? lastShot.activeNodeId : activeNodeId,
+            dur
+          );
 
           if (recorder && recorder.state !== 'inactive') {
             recorder.stop();
@@ -758,6 +959,9 @@ export default function App() {
       } else if (e.altKey && e.key.toLowerCase() === 's') {
         e.preventDefault();
         handleAddNode();
+      } else if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'c' && activeMedia.type === 'video') {
+        e.preventDefault();
+        handleSplitShot();
       } else if (e.key === ' ' && activeMedia.type === 'video') {
         e.preventDefault();
         toggleVideoPlay();
@@ -771,6 +975,7 @@ export default function App() {
     handleToggleNode,
     activeNodeId,
     handleAddNode,
+    handleSplitShot,
     activeMedia.type,
     toggleVideoPlay,
   ]);
@@ -974,6 +1179,102 @@ export default function App() {
                   className="block max-h-full max-w-full rounded-[2px] border border-white/[0.06] bg-black object-contain shadow-2xl"
                 />
 
+                {/* Power Window Interactive Mask Outline Overlay */}
+                {activeNode.mask.shape !== 'none' && activeNode.mask.showOverlay && (
+                  <div className="pointer-events-none absolute inset-0 z-10 overflow-hidden">
+                    <svg
+                      viewBox="0 0 100 100"
+                      preserveAspectRatio="none"
+                      className="h-full w-full"
+                    >
+                      <g
+                        transform={`translate(${activeNode.mask.centerX * 100} ${activeNode.mask.centerY * 100}) rotate(${-activeNode.mask.rotation})`}
+                      >
+                        {activeNode.mask.shape === 'ellipse' && (
+                          <ellipse
+                            cx={0}
+                            cy={0}
+                            rx={activeNode.mask.width * 100}
+                            ry={activeNode.mask.height * 100}
+                            fill="none"
+                            stroke="#E5892E"
+                            strokeWidth="0.45"
+                            strokeDasharray="1.8 1.2"
+                          />
+                        )}
+                        {activeNode.mask.shape === 'rectangle' && (
+                          <rect
+                            x={-activeNode.mask.width * 100}
+                            y={-activeNode.mask.height * 100}
+                            width={activeNode.mask.width * 200}
+                            height={activeNode.mask.height * 200}
+                            fill="none"
+                            stroke="#E5892E"
+                            strokeWidth="0.45"
+                            strokeDasharray="1.8 1.2"
+                          />
+                        )}
+                        {activeNode.mask.shape === 'linear' && (
+                          <>
+                            <line
+                              x1={-140}
+                              y1={0}
+                              x2={140}
+                              y2={0}
+                              stroke="#E5892E"
+                              strokeWidth="0.5"
+                              strokeDasharray="2 1.2"
+                            />
+                            <line
+                              x1={0}
+                              y1={0}
+                              x2={0}
+                              y2={-Math.max(4, activeNode.mask.feather * 40)}
+                              stroke="#E5892E"
+                              strokeWidth="0.4"
+                            />
+                          </>
+                        )}
+                      </g>
+                    </svg>
+                    {/* Draggable Center Point Handle */}
+                    <div
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        const canvas = canvasRef.current;
+                        if (!canvas) return;
+                        const rect = canvas.getBoundingClientRect();
+                        const moveTo = (cx: number, cy: number) => {
+                          const nx = Math.max(0, Math.min(1, (cx - rect.left) / rect.width));
+                          const ny = Math.max(0, Math.min(1, (cy - rect.top) / rect.height));
+                          updateActiveNode((n) => ({
+                            ...n,
+                            mask: {
+                              ...n.mask,
+                              centerX: Number(nx.toFixed(3)),
+                              centerY: Number(ny.toFixed(3)),
+                            },
+                          }));
+                        };
+                        const onMove = (ev: PointerEvent) => moveTo(ev.clientX, ev.clientY);
+                        const onUp = () => {
+                          window.removeEventListener('pointermove', onMove);
+                          window.removeEventListener('pointerup', onUp);
+                          commitHistory();
+                        };
+                        window.addEventListener('pointermove', onMove);
+                        window.addEventListener('pointerup', onUp);
+                      }}
+                      style={{
+                        left: `${activeNode.mask.centerX * 100}%`,
+                        top: `${activeNode.mask.centerY * 100}%`,
+                      }}
+                      title="Drag to reposition Power Window mask"
+                      className="pointer-events-auto absolute h-4 w-4 -translate-x-1/2 -translate-y-1/2 cursor-move rounded-full border-2 border-[#E5892E] bg-[#0C0C0E]/80 shadow-md"
+                    />
+                  </div>
+                )}
+
                 {/* Wipe Split Overlay Handle */}
                 {compareMode === 'wipe' && (
                   <div
@@ -1018,35 +1319,28 @@ export default function App() {
             )}
           </div>
 
-          {/* Video Playback Bar (only shown when grading video) */}
+          {/* Multi-Shot Video Timeline Bar (only shown when grading video) */}
           {activeMedia.type === 'video' && (
-            <div className="flex items-center gap-3 border-t border-white/[0.06] bg-[#111115] px-4 py-1.5">
-              <button
-                type="button"
-                onClick={toggleVideoPlay}
-                className="flex h-6 w-6 items-center justify-center rounded bg-[#222228] text-white transition-colors hover:bg-[#E5892E] hover:text-black"
-                title="Play / Pause (Space)"
-              >
-                {videoPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
-              </button>
-              <input
-                type="range"
-                min={0}
-                max={Math.max(0.1, videoDuration)}
-                step={0.01}
-                value={videoTime}
-                onChange={(e) => handleVideoSeek(parseFloat(e.target.value))}
-                className="h-1 flex-1 accent-[#E5892E]"
-              />
-              <span className="font-mono-num text-[11px] text-[#8E8E98]">
-                {videoTime.toFixed(2)}s / {videoDuration.toFixed(2)}s
-              </span>
-            </div>
+            <ShotTimelineBar
+              shots={shots}
+              activeShotId={activeShotId}
+              currentTime={videoTime}
+              duration={videoDuration}
+              playing={videoPlaying}
+              hasCopiedGrade={Boolean(copiedShotNodes)}
+              onTogglePlay={toggleVideoPlay}
+              onSeek={handleVideoSeek}
+              onSelectShot={handleSelectShot}
+              onSplitAtPlayhead={handleSplitShot}
+              onCopyShotGrade={handleCopyShotGrade}
+              onPasteShotGrade={handlePasteShotGrade}
+              onMergeShot={handleMergeShot}
+            />
           )}
 
           {/* Slim Viewer Transport & Diagnostic Bar */}
           <div className="flex h-9 shrink-0 items-center justify-between gap-3 border-t border-white/[0.07] bg-[#121216] px-3.5">
-            {/* Left: History + Bypass + Grab Still */}
+            {/* Left: History + Bypass + Grab Still + Tutorial Download */}
             <div className="flex items-center gap-1.5">
               <button
                 type="button"
@@ -1092,6 +1386,16 @@ export default function App() {
                 <Camera className="h-3 w-3" />
                 Grab Still
               </button>
+
+              <a
+                href="/ChromaGrade_Color_Grading_Tutorial.docx"
+                download="ChromaGrade_Color_Grading_Tutorial.docx"
+                title="Download Full Color Grading Tutorial Manual (Microsoft Word .docx)"
+                className="flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium text-[#E5892E] transition-colors hover:bg-[#E5892E]/10 whitespace-nowrap"
+              >
+                <BookOpen className="h-3 w-3" />
+                Guide (.docx)
+              </a>
             </div>
 
             {/* Center: Compare & Diagnostic Overlays */}
@@ -1307,6 +1611,14 @@ export default function App() {
             <QualifierPanel
               qualifier={activeNode.qualifier}
               onChange={(qualifier) => updateActiveNode((n) => ({ ...n, qualifier }))}
+              onCommit={() => commitHistory()}
+            />
+          )}
+
+          {activeTool === 'mask' && (
+            <MaskPanel
+              mask={activeNode.mask}
+              onChange={(mask) => updateActiveNode((n) => ({ ...n, mask }))}
               onCommit={() => commitHistory()}
             />
           )}
