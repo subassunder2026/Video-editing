@@ -1,0 +1,6 @@
+{
+  "name": "ChromaGrade",
+  "description": "Professional GPU-accelerated color grading workstation with primary and log color wheels, 6-zone HDR grading, spline and Hue/Sat/Lum curves, HSL qualifier, serial nodes, live broadcast scopes, and 3D LUT export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
